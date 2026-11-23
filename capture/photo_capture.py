@@ -1,28 +1,17 @@
-# we need 3 terminals
-# deactivate conda for all of them
-# one for isaacsim (see anleitung there)
-# one for ros node , open a terminal and paste: ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e
-# open a third terminal and run: python3 /home/AP_PathMatters/path_matters/Isaacsim/scripts/17_12_ur_move.py
-
-# STEPS:
-
-# 1st terminal:
-# conda deactivate
-# cd isaacsim/_build/linux-x86_64/release
-# ./isaac-sim.sh 
-# open : 17_12_robot_plane_graph.usd
-
-
-# 2nd terminal:
-# conda deactivate
-# ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e
-
-# 3rd terminal:
-# conda deactivate
-# python3 /home/AP_PathMatters/path_matters/Isaacsim/scripts/trajectory/26_01_ur_move.py
+# How to run (three terminals, conda deactivated in each):
+#
+# 1) Isaac Sim:
+#    cd isaacsim/_build/linux-x86_64/release
+#    ./isaac-sim.sh            # then open the robot scene (UR5e + camera)
+#
+# 2) MoveIt2:
+#    ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e
+#
+# 3) This script:
+#    python3 capture/photo_capture.py
 #!/usr/bin/env python3
 """
-UR5e Photo Capture - CORRECTED Version
+UR5e Photo Capture
 Uses "world" frame (which the diagnostic confirmed works!)
 """
 
@@ -237,7 +226,7 @@ def main():
     rclpy.init()
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"/home/AP_PathMatters/path_matters/trajectory/captures/captured_photos_{timestamp}"
+    save_dir = f"captures/captured_photos_{timestamp}"
     
     ur = URPhotoCapture(save_dir=save_dir)
     

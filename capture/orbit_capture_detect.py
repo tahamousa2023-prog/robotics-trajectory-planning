@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ur5e_orbit_capture_detect.py
-===========================
+orbit_capture_detect.py
+=======================
 
-What it does (keeps your working pipeline):
+What it does:
   1) Move to HOME (IK + smooth interpolation + /joint_command)
   2) Run object detection on the HOME camera image
   3) Convert detection result into a world-frame object center (x,y) and pick orbit params
@@ -12,9 +12,9 @@ What it does (keeps your working pipeline):
 
 Notes:
   - Uses the SAME IK service /compute_ik and the SAME manual interpolation
-  - Keeps your stable look_at_quaternion() (fixed roll)
-  - Keeps your wrist_2 flip + continuity fix
-  - Home pose is taken from your older script
+  - Stable look_at_quaternion() with fixed roll
+  - wrist_2 flip and joint continuity fix
+  - Home pose from the earlier capture scripts
 
 Requires:
   - modular_object_detection.py providing create_detection_pipeline()
@@ -66,7 +66,7 @@ COMMAND_TOPIC = "/joint_command"
 IK_SERVICE    = "/compute_ik"
 
 # Output
-CAPTURE_BASE = "/home/AP_PathMatters/path_matters/trajectory/captures"
+CAPTURE_BASE = "/path/to/path_matters/trajectory/captures"
 
 # Timing
 INTERP_STEPS         = 40
@@ -684,7 +684,7 @@ if __name__ == "__main__":
 # IK_SERVICE    = "/compute_ik"
 
 # # --- Output ---
-# CAPTURE_BASE = "/home/AP_PathMatters/path_matters/trajectory/captures"
+# CAPTURE_BASE = "/path/to/path_matters/trajectory/captures"
 
 # # --- Timing ---
 # INTERP_STEPS       = 40      # waypoints between current and target

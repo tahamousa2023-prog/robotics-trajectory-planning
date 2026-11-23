@@ -132,9 +132,9 @@ class SAMDetector(ObjectDetector):
         # Default checkpoint paths
         if checkpoint_path is None:
             checkpoint_paths = {
-                'vit_h': '/home/AP_PathMatters/segment-anything/sam_vit_h_4b8939.pth',
-                'vit_l': '/home/AP_PathMatters/segment-anything/sam_vit_l_0b3195.pth',
-                'vit_b': '/home/AP_PathMatters/segment-anything/sam_vit_b_01ec64.pth'
+                'vit_h': 'checkpoints/sam_vit_h_4b8939.pth',
+                'vit_l': 'checkpoints/sam_vit_l_0b3195.pth',
+                'vit_b': 'checkpoints/sam_vit_b_01ec64.pth'
             }
             checkpoint_path = checkpoint_paths.get(model_type, checkpoint_paths['vit_h'])
         

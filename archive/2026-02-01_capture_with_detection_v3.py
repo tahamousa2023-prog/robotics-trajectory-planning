@@ -1,7 +1,69 @@
+def generate_circular_ring_waypoints(object_center, radius, elevation_deg, n_points, robot):
+    """
+    Generate evenly spaced, reachable waypoints in a circle around the object at a given elevation.
+    Returns a list of dicts with x, y, z, qx, qy, qz, qw.
+    """
+    waypoints = []
+    elevation_rad = math.radians(elevation_deg)
+    min_clearance = 0.25
+    for i in range(n_points):
+        azimuth_deg = (360.0 / n_points) * i
+        azimuth_rad = math.radians(azimuth_deg)
+        x_offset = radius * math.cos(azimuth_rad) * math.cos(elevation_rad)
+        y_offset = radius * math.sin(azimuth_rad) * math.cos(elevation_rad)
+        z_offset = radius * math.sin(elevation_rad)
+        camera_pos = {
+            'x': object_center['x'] + x_offset,
+            'y': object_center['y'] + y_offset,
+            'z': max(object_center['z'] + z_offset + 0.1, min_clearance)
+        }
+        qx, qy, qz, qw = URControlWithDetection.look_at_orientation(camera_pos, object_center)
+        # Check reachability
+        pose = PoseStamped()
+        pose.header.frame_id = "world"
+        pose.pose.position.x = float(camera_pos['x'])
+        pose.pose.position.y = float(camera_pos['y'])
+        pose.pose.position.z = float(camera_pos['z'])
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = "ur_manipulator"
+        req.ik_request.ik_link_name = "tool0"
+        req.ik_request.pose_stamped = pose
+        req.ik_request.timeout.sec = 2
+        req.ik_request.avoid_collisions = False
+        req.ik_request.robot_state.joint_state.name = robot.joints
+        req.ik_request.robot_state.joint_state.position = robot.current_joints
+        req.ik_request.robot_state.joint_state.header.stamp = robot.get_clock().now().to_msg()
+        future = robot.ik.call_async(req)
+        rclpy.spin_until_future_complete(robot, future, timeout_sec=3)
+        try:
+            response = future.result()
+            if response and response.error_code.val == 1:
+                waypoints.append({
+                    'x': camera_pos['x'],
+                    'y': camera_pos['y'],
+                    'z': camera_pos['z'],
+                    'qx': qx, 'qy': qy, 'qz': qz, 'qw': qw
+                })
+        except Exception:
+            continue
+    return waypoints
+
+def execute_ring_capture(robot, waypoints, save_dir=None):
+    """
+    Move to each waypoint and capture a photo. Only move to valid, reachable positions.
+    """
+    for i, wp in enumerate(waypoints):
+        success = robot.goto_smooth(wp['x'], wp['y'], wp['z'], wp['qx'], wp['qy'], wp['qz'], wp['qw'], steps=50)
+        if success and save_dir:
+            robot.capture_photo(f"ring_{i:03d}", save_dir)
 #!/usr/bin/env python3
 """
 UR5e Robot with Automatic Object Detection and Multi-View Capture
-SIMPLE APPROACH: Direct IK (your original working code) + Ground plane in planning scene
+OPTIMIZED FOR 3D RECONSTRUCTION: Multi-ring capture with proper camera orientation
 """
 
 import rclpy
@@ -22,6 +84,16 @@ from modular_object_detection import create_detection_pipeline
 
 
 class URControlWithDetection(Node):
+    def move_to_joint_positions(self, joint_positions, steps=50):
+        """Move robot directly to specified joint positions (no IK)."""
+        if len(joint_positions) != 6:
+            self.get_logger().error("✗ Joint positions must have 6 values.")
+            return False
+        trajectory = self.interpolate_joints(self.current_joints, joint_positions, steps)
+        self.execute_trajectory(trajectory, duration_per_step=0.04)
+        self.current_joints = list(joint_positions)
+        self.get_logger().info("  ✓ Moved to pre-home joint state")
+        return True
     def __init__(self, detection_method='color'):
         super().__init__('ur_control_detection')
         
@@ -143,25 +215,25 @@ class URControlWithDetection(Node):
             return False
     
     def add_ground_plane(self):
-        """Add ground plane to planning scene (MoveIt recommended approach)"""
+        """Add ground plane to planning scene"""
         self.get_logger().info("Adding ground plane to planning scene...")
         
         scene_msg = PlanningScene()
         scene_msg.is_diff = True
         
         ground = CollisionObject()
-        ground.header.frame_id = "World"
+        ground.header.frame_id = "world"  # Isaac Sim frame
         ground.header.stamp = self.get_clock().now().to_msg()
         ground.id = "ground_plane"
         
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
-        box.dimensions = [3.0, 3.0, 0.01]  # 3m x 3m x 1cm
+        box.dimensions = [3.0, 3.0, 0.01]
         
         ground_pose = Pose()
         ground_pose.position.x = 0.0
         ground_pose.position.y = 0.0
-        ground_pose.position.z = -0.005  # Top surface at z=0
+        ground_pose.position.z = -0.005
         ground_pose.orientation.w = 1.0
         
         ground.primitives.append(box)
@@ -170,16 +242,11 @@ class URControlWithDetection(Node):
         
         scene_msg.world.collision_objects.append(ground)
         
-        # Publish MULTIPLE times (recommended by MoveIt documentation)
-        # This ensures MoveIt receives and processes the message
         for i in range(10):
             self.scene_pub.publish(scene_msg)
             time.sleep(0.1)
         
         self.get_logger().info("✓ Ground plane published to planning scene")
-        self.get_logger().info("  To verify: ros2 topic echo /planning_scene --once")
-        
-        # Additional wait for processing
         time.sleep(0.5)
     
     @staticmethod
@@ -193,35 +260,58 @@ class URControlWithDetection(Node):
         z = cr*cp*sy - sr*sp*cy
         return x, y, z, w
     
-    def goto_smooth(self, x, y, z, rx=math.pi, ry=0.0, rz=0.0, steps=40):
-        """Move robot (your original working code)"""
+    @staticmethod
+    def look_at_orientation(camera_pos, target_pos):
+        """
+        Calculate quaternion for camera to look at target
+        Camera points along -Z axis (standard camera convention)
+        """
+        # Direction from camera to target
+        dx = target_pos['x'] - camera_pos['x']
+        dy = target_pos['y'] - camera_pos['y']
+        dz = target_pos['z'] - camera_pos['z']
         
-        # Simple safety check before calling IK
-        if z < 0.3:
-            self.get_logger().warn(f"⚠ Target z={z:.3f}m too low, adjusting to 0.3m")
-            z = 0.3
-        # z = 0.25
+        # Horizontal angle (azimuth)
+        yaw = math.atan2(dy, dx)
+        
+        # Vertical angle (elevation)
+        horizontal_dist = math.sqrt(dx**2 + dy**2)
+        pitch = math.atan2(-dz, horizontal_dist)
+        
+        # Camera roll (keep level)
+        roll = 0.0
+        
+        # Convert to quaternion
+        qx, qy, qz, qw = URControlWithDetection.euler_to_quat(roll, pitch, yaw)
+        
+        return qx, qy, qz, qw
+    
+    def goto_smooth(self, x, y, z, qx, qy, qz, qw, steps=50):
+        """Move robot with quaternion orientation - USING YOUR WORKING PARAMETERS"""
+        
+        if z < 0.25:
+            self.get_logger().warn(f"⚠ Target z={z:.3f}m too low, adjusting to 0.25m")
+            z = 0.25
+        
         self.get_logger().info(f"→ Moving to ({x:.3f}, {y:.3f}, {z:.3f})")
         
         pose = PoseStamped()
-        pose.header.frame_id = "World"
+        pose.header.frame_id = "world"  # Isaac Sim frame
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
         pose.pose.position.z = float(z)
-        
-        qx, qy, qz, qw = self.euler_to_quat(rx, ry, rz)
         pose.pose.orientation.x = qx
         pose.pose.orientation.y = qy
         pose.pose.orientation.z = qz
         pose.pose.orientation.w = qw
         
         req = GetPositionIK.Request()
-        req.ik_request.group_name = "arm"
-        req.ik_request.ik_link_name = "wrist_3_link"
+        req.ik_request.group_name = "ur_manipulator"
+        req.ik_request.ik_link_name = "tool0"
         req.ik_request.pose_stamped = pose
         req.ik_request.timeout.sec = 5
-        req.ik_request.avoid_collisions = True
+        req.ik_request.avoid_collisions = False
         req.ik_request.robot_state.joint_state.name = self.joints
         req.ik_request.robot_state.joint_state.position = self.current_joints
         req.ik_request.robot_state.joint_state.header.stamp = self.get_clock().now().to_msg()
@@ -237,7 +327,7 @@ class URControlWithDetection(Node):
             
             target_joints = list(response.solution.joint_state.position[:6])
             trajectory = self.interpolate_joints(self.current_joints, target_joints, steps)
-            self.execute_trajectory(trajectory, duration_per_step=0.05)
+            self.execute_trajectory(trajectory, duration_per_step=0.04)
             self.current_joints = target_joints
             self.get_logger().info("  ✓ Movement complete")
             return True
@@ -245,16 +335,17 @@ class URControlWithDetection(Node):
             self.get_logger().error(f"✗ Error: {e}")
             return False
     
-    def interpolate_joints(self, start, end, steps=30):
+    def interpolate_joints(self, start, end, steps=50):
         trajectory = []
         for i in range(steps + 1):
             t = i / steps
+            # Smooth S-curve interpolation
             smooth_t = 3*t**2 - 2*t**3
             interpolated = [s + smooth_t * (e - s) for s, e in zip(start, end)]
             trajectory.append(interpolated)
         return trajectory
     
-    def execute_trajectory(self, trajectory, duration_per_step=0.05):
+    def execute_trajectory(self, trajectory, duration_per_step=0.04):
         for joints in trajectory:
             msg = JointState()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -264,43 +355,50 @@ class URControlWithDetection(Node):
             time.sleep(duration_per_step)
 
 
-def generate_viewpoints_around_object(object_center, object_size, n_views=12, camera_distance=0.3):
+def generate_multiview_for_3d_reconstruction(object_center, camera_distance=0.35, robot=None):
+    """
+    Generate SIMPLE circular viewpoints for 3D reconstruction
+    Based on working reference code patterns
+    """
     viewpoints = []
-    
-    # Top view - HIGH
+    rings = [
+        {'name': 'Low', 'elevation_deg': 25, 'n_views': 8},
+        {'name': 'Mid', 'elevation_deg': 45, 'n_views': 8},
+        {'name': 'High', 'elevation_deg': 65, 'n_views': 8},
+    ]
+    view_id = 0
+    min_z = 0.25
+    for ring in rings:
+        elevation_rad = math.radians(ring['elevation_deg'])
+        n_views = ring['n_views']
+        for i in range(n_views):
+            azimuth_deg = (360.0 / n_views) * i
+            azimuth_rad = math.radians(azimuth_deg)
+            x_offset = camera_distance * math.cos(azimuth_rad) * math.cos(elevation_rad)
+            y_offset = camera_distance * math.sin(azimuth_rad) * math.cos(elevation_rad)
+            z_offset = camera_distance * math.sin(elevation_rad)
+            camera_x = object_center['x'] + x_offset
+            camera_y = object_center['y'] + y_offset
+            camera_z = max(object_center['z'] + z_offset + 0.05, min_z)
+            rx = math.pi
+            ry = 0.0
+            rz = azimuth_rad
+            qx, qy, qz, qw = URControlWithDetection.euler_to_quat(rx, ry, rz)
+            viewpoints.append({
+                'name': f'{view_id:02d}-{ring["name"]}-{azimuth_deg:03.0f}deg',
+                'x': camera_x,
+                'y': camera_y,
+                'z': camera_z,
+                'qx': qx, 'qy': qy, 'qz': qz, 'qw': qw
+            })
+            view_id += 1
     viewpoints.append({
-        'name': '0-Top',
+        'name': f'{view_id:02d}-Top',
         'x': object_center['x'],
         'y': object_center['y'],
-        'z': object_center['z'] + 0.5,  # 50cm above object
-        'rx': math.pi, 'ry': 0.0, 'rz': 0.0
+        'z': object_center['z'] + 0.35,
+        'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0
     })
-    
-    # Ring at 50° elevation (balanced - not too flat, not too steep)
-    elevation_angle = math.radians(50)  
-    n_ring_views = n_views - 1
-    
-    for i in range(n_ring_views):
-        azimuth_deg = (360.0 / n_ring_views) * i
-        azimuth_rad = math.radians(azimuth_deg)
-        
-        x_offset = camera_distance * math.cos(azimuth_rad) * math.cos(elevation_angle)
-        y_offset = camera_distance * math.sin(azimuth_rad) * math.cos(elevation_angle)
-        z_offset = camera_distance * math.sin(elevation_angle)
-        
-        # Ensure minimum height above ground
-        final_z = object_center['z'] + z_offset + 0.35
-        if final_z < 0.2:  # Safety margin
-            final_z = 0.2
-        
-        viewpoints.append({
-            'name': f'{i+1}-Ring{azimuth_deg:.0f}deg',
-            'x': object_center['x'] + x_offset,
-            'y': object_center['y'] + y_offset,
-            'z': final_z,
-            'rx': math.pi, 'ry': 0.0, 'rz': 0.0
-        })
-    
     return viewpoints
 
 
@@ -312,8 +410,8 @@ def main():
         robot = URControlWithDetection(detection_method=detection_method)
         
         print("\n" + "="*70)
-        print("UR5e Multi-View Capture")
-        print("Method: Direct IK + Ground Plane in Planning Scene")
+        print("UR5e Multi-View Capture for 3D Reconstruction")
+        print("Optimized: 3 elevation rings + top view = 25 images")
         print("="*70)
         
         # Wait for camera
@@ -329,20 +427,30 @@ def main():
         
         print("✓ Camera ready")
         
-        # HOME
-        HOME = {'x': 0.45, 'y': 0.15, 'z': 0.7, 'rx': math.pi, 'ry': 0.0, 'rz': 0.0}
-        
+        # Simple HOME (based on working code)
+        HOME = {'x': 0.4, 'y': 0.1, 'z': 0.6}
+        rx = math.pi
+        ry = 0.0
+        rz = 0.0
+        qx, qy, qz, qw = URControlWithDetection.euler_to_quat(rx, ry, rz)
+        HOME_QUAT = {'qx': qx, 'qy': qy, 'qz': qz, 'qw': qw}
+
         print(f"\n{'='*70}")
         print("STEP 1: Moving to HOME")
         print(f"{'='*70}")
-        
-        if not robot.goto_smooth(HOME['x'], HOME['y'], HOME['z'], HOME['rx'], HOME['ry'], HOME['rz']):
+
+        if not robot.goto_smooth(HOME['x'], HOME['y'], HOME['z'], 
+                                 HOME_QUAT['qx'], HOME_QUAT['qy'], 
+                                 HOME_QUAT['qz'], HOME_QUAT['qw']):
             print("✗ Failed to reach HOME")
             return
+        time.sleep(1.5)
+
+        # (STEP 3 and onward: Detect object, etc...)
         
         time.sleep(1.5)
         
-        # Detect
+        # Detect object
         print(f"\n{'='*70}")
         print("STEP 2: Detecting object")
         print(f"{'='*70}")
@@ -358,73 +466,54 @@ def main():
         print(f"✓ Object detected!")
         print(f"  Size: {size_info['width_m']*100:.1f} × {size_info['height_m']*100:.1f} cm")
         
-        # Object position
+        # Calculate object center in world frame
         object_center_world = {
             'x': HOME['x'] + size_info['center_x_m'],
             'y': HOME['y'] + size_info['center_y_m'],
             'z': 0.05
         }
         
-        # Generate viewpoints
+        # Simple multi-view circular capture
         print(f"\n{'='*70}")
-        print("STEP 3: Generating viewpoints")
+        print("STEP 3: Executing robust circular multi-view capture")
         print(f"{'='*70}")
-        
-        viewpoints = generate_viewpoints_around_object(
-            object_center=object_center_world,
-            object_size=size_info,
-            n_views=12,
-            camera_distance=0.3  # 30cm from object
-        )
-        
-        print(f"✓ {len(viewpoints)} viewpoints generated")
-        print(f"  Distance: 30cm, Elevation: 50°")
-        print(f"  All positions have 20cm+ ground clearance")
-        
-        # Capture
-        print(f"\n{'='*70}")
-        print("STEP 4: Capturing images")
-        print(f"{'='*70}")
-        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = f"/home/AP_PathMatters/path_matters/trajectory/captures/multiview_capture_{timestamp}"
-        
-        success_count = 0
-        photo_count = 0
-        
-        for i, vp in enumerate(viewpoints):
-            print(f"\n📸 {i+1}/{len(viewpoints)}: {vp['name']}")
-            
-            success = robot.goto_smooth(vp['x'], vp['y'], vp['z'], vp['rx'], vp['ry'], vp['rz'])
-            
-            if success:
-                success_count += 1
-                time.sleep(0.8)
-                
-                old_img = robot.latest_image
-                frame_wait = 0
-                while frame_wait < 2.0:
-                    rclpy.spin_once(robot, timeout_sec=0.1)
-                    if robot.latest_image != old_img:
-                        break
-                    frame_wait += 0.1
-                
-                if robot.capture_photo(vp['name'], save_dir):
-                    photo_count += 1
-            else:
-                print(f"✗ Skipped (collision or unreachable)")
-        
+        save_dir = f"captures/3d_recon_simple_{timestamp}"
+        os.makedirs(save_dir, exist_ok=True)
+        n_points = 24  # Fewer, evenly spaced views per ring
+        rings = [
+            {'name': 'Low', 'elevation_deg': 20, 'radius': 0.32},
+            {'name': 'Mid', 'elevation_deg': 45, 'radius': 0.32},
+            {'name': 'High', 'elevation_deg': 70, 'radius': 0.32},
+        ]
+        for ring in rings:
+            print(f"\n-- {ring['name']} ring at {ring['elevation_deg']}° --")
+            waypoints = generate_circular_ring_waypoints(
+                object_center=object_center_world,
+                radius=ring['radius'],
+                elevation_deg=ring['elevation_deg'],
+                n_points=n_points,
+                robot=robot
+            )
+            print(f"  Reachable views: {len(waypoints)}/{n_points}")
+            execute_ring_capture(robot, waypoints, save_dir)
+        # Top view
+        print(f"\n-- Top view --")
+        top_pos = {
+            'x': object_center_world['x'],
+            'y': object_center_world['y'],
+            'z': object_center_world['z'] + 0.42
+        }
+        robot.goto_smooth(top_pos['x'], top_pos['y'], top_pos['z'], 0.0, 0.0, 0.0, 1.0)
+        robot.capture_photo("top_view", save_dir)
         # Return HOME
         print(f"\n🏠 Returning to HOME...")
-        robot.goto_smooth(HOME['x'], HOME['y'], HOME['z'], HOME['rx'], HOME['ry'], HOME['rz'])
-        
-        # Summary
+        robot.goto_smooth(HOME['x'], HOME['y'], HOME['z'], HOME_QUAT['qx'], HOME_QUAT['qy'], HOME_QUAT['qz'], HOME_QUAT['qw'])
         print(f"\n{'='*70}")
-        print("✓ COMPLETE")
+        print("✓ SIMPLE CIRCULAR CAPTURE COMPLETE")
         print(f"{'='*70}")
-        print(f"  Reached: {success_count}/{len(viewpoints)}")
-        print(f"  Photos: {photo_count}/{len(viewpoints)}")
-        print(f"  Folder: {os.path.abspath(save_dir)}")
+        print(f"  Save location: {os.path.abspath(save_dir)}")
+        print(f"\n💡 Ready for 3D reconstruction!")
         print(f"{'='*70}\n")
         
     except KeyboardInterrupt:
